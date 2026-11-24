@@ -14,6 +14,15 @@ kernel signing queries are modeled. Safari playback requires a separate test.
 
 ## Maintaining test contracts
 
+The \`tgl_optional_panel_rate\` job (run with \`--require tgl_optional_panel_rate\`)
+exercises the production TGL AUX wrappers against a model of the receiver in
+[issue #154](https://github.com/b00t0x/WhateverXe/issues/154). It checks legacy
+capability reads, 2.70/5.40 Gbit/s index selection, write order, preservation of
+the lane byte, native delegation for external and different receivers, and
+busy, failed-write and failed-readback results. Port ownership and AUX
+transactions are modeled. The test does not exercise Lilu routing, native AUX
+locking or physical link training.
+
 `tgl_recovery` runs the production wrapper and helper against ABI-matched
 reset, scheduler, event-machine, submit and wait callees. The exact TGL donor's
 successful non-render branch provides the increment/submit/one-second wait

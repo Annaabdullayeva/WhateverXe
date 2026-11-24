@@ -13715,7 +13715,8 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
     const uint32_t offsets[] {0x1CC72,0x1CEB0,0x1D2B6};
     const char *names[] {"__ZN14AppleIntelPort7readAUXEjPvj","__ZN14AppleIntelPort8writeAUXEjPvj","__ZN14AppleIntelPort13runI2COverAUXENS_11AUX_CommandEPjjh"};
     const uint8_t entries[3][16] {{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec},{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec},{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec}};
-    bool auxKnown=auxTrial && size>=0x1D2C6;
+    const bool optionalPanelTrial=checkKernelArgument("-wex-shp14b8-rate");
+    bool auxKnown=(auxTrial || optionalPanelTrial) && size>=0x1D2C6;
     if(auxKnown)for(unsigned i=0;i<3;++i){
      const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,names[i],address,size);
      auxKnown&=fn==address+offsets[i] && !memcmp(reinterpret_cast<const void *>(address+offsets[i]),entries[i],16);
@@ -13733,7 +13734,9 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				const bool routed = patcher.routeMultiple(index, observations, arrsize(observations), address, size);
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGRoutePathObservations", routed);
 				patcher.clearError();
-    if(auxKnown && routed && orgTGLReadAUX && orgTGLWriteAUX){
+    tglOptionalPanelRateReady = auxKnown && routed && orgTGLReadAUX && orgTGLWriteAUX &&
+        optionalPanelTrial;
+    if(auxTrial && auxKnown && routed && orgTGLReadAUX && orgTGLWriteAUX){
      KernelPatcher::RouteRequest route(names[2],wrapTGLI2CAUX,orgTGLI2CAUX);
      tglBootstrapAUXReady=patcher.routeMultiple(index,&route,1,address,size);
      patcher.clearError();
@@ -20270,6 +20273,79 @@ void XE::wrapTGLEnablePipe(void *controller, void *fb, void *path, const void *t
 	tglObserveScanout(fb, nullptr, 3, true, 0);
 }
 
+// Issue #154: restrict the optional-rate workaround to the firmware-owned
+// internal eDP port. A zero legacy rate in DPCD alone does not identify a panel.
+bool XE::tglOptionalPanelPort(void *port) const {
+    if (!tglOptionalPanelRateReady || !tglActive || xeProfile.identity != 0x9A498086 ||
+        xeProfile.revision != 1 || xeProfile.overridden() || !port || !tglObservationController || !firmwarePorts.valid())
+        return false;
+
+    const auto &panel = firmwarePorts.panel;
+    if (!panel.valid || panel.ddi >= 2 || !(firmwarePorts.present & (1U << panel.ddi)) ||
+        !firmwarePorts.port[panel.ddi].internal() || !firmwarePorts.port[panel.ddi].dp())
+        return false;
+
+    const auto bytes = static_cast<uint8_t *>(port);
+    const auto config = Display13FBMemory::field<uint32_t *>(bytes, 0x548);
+    const auto access = Display13FBMemory::field<void *>(bytes, 0x578);
+    return config && config[0] == panel.ddi && config[2] == 0 && config[3] == 0 &&
+        !bytes[0x117] && access &&
+        access == Display13FBMemory::field<void *>(static_cast<uint8_t *>(tglObservationController), 0xC40);
+}
+
+namespace {
+constexpr uint32_t PanelLinkRate = 0x001;
+constexpr uint32_t PanelRateTable = 0x010;
+constexpr uint32_t PanelBandwidthSet = 0x100;
+constexpr uint32_t PanelRateSet = 0x115;
+// Indices match the observed SHP14B8 rate table. Zero entries have no
+// equivalent in the donor's legacy rate encoding.
+constexpr uint8_t PanelLegacyRates[] {0x06, 0, 0, 0x0A, 0, 0, 0, 0x14};
+
+int tglOptionalPanelIndex(uint8_t legacyRate) {
+    if (legacyRate != 0) {
+        for (unsigned i = 0; i < sizeof(PanelLegacyRates); ++i)
+            if (PanelLegacyRates[i] == legacyRate)
+                return i;
+    }
+    return -1;
+}
+
+template <typename Operation>
+bool tglOptionalPanelCaps(Operation read) {
+    // Match the reported receiver capabilities and table before translating
+    // transactions. Other optional-rate receivers may use different indices.
+    const uint8_t expectedCaps[] {0x14, 0x00, 0xC2, 0x41};
+    const uint8_t expectedRates[] {
+        0xA4, 0x1F, 0x30, 0x2A, 0x76, 0x2F, 0xBC, 0x34,
+        0x48, 0x3F, 0xD4, 0x49, 0x60, 0x54, 0x78, 0x69
+    };
+    uint8_t caps[sizeof(expectedCaps)] {};
+    uint8_t rates[sizeof(expectedRates)] {};
+    return !read(0, caps, sizeof(caps)) && !memcmp(caps, expectedCaps, sizeof(caps)) &&
+        !read(PanelRateTable, rates, sizeof(rates)) && !memcmp(rates, expectedRates, sizeof(rates));
+}
+
+// Serialize the workaround itself without holding a lock across native AUX
+// calls. Native port code still owns electrical AUX arbitration.
+class PanelAUXScope {
+    uint32_t *owned;
+public:
+    explicit PanelAUXScope(uint32_t &busy) : owned(nullptr) {
+        uint32_t idle = 0;
+        if (__atomic_compare_exchange_n(&busy, &idle, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            owned = &busy;
+    }
+    ~PanelAUXScope() {
+        if (owned)
+            __atomic_store_n(owned, 0, __ATOMIC_RELEASE);
+    }
+    explicit operator bool() const { return owned != nullptr; }
+    PanelAUXScope(const PanelAUXScope &) = delete;
+    PanelAUXScope &operator=(const PanelAUXScope &) = delete;
+};
+}
+
 uint32_t XE::wrapTGLReadAUX(void *port, uint32_t address, void *data, uint32_t length) {
 	auto caller = __builtin_return_address(0);
 	tglDPCDRecord(port, address, data, length, false, false, 0, caller);
@@ -20277,14 +20353,73 @@ uint32_t XE::wrapTGLReadAUX(void *port, uint32_t address, void *data, uint32_t l
 		return FunctionCast(wrapTGLReadAUX, callbackXE->orgTGLReadAUX)(port, address, data, length);
 	});
 	tglDPCDRecord(port, address, data, length, false, true, r, caller);
+	if (!r && data && ((address <= PanelLinkRate && length > PanelLinkRate - address) ||
+	                   (address == PanelBandwidthSet && length)) && callbackXE->tglOptionalPanelPort(port)) {
+	    PanelAUXScope scope(callbackXE->tglOptionalPanelAUXBusy);
+	    auto bytes = static_cast<uint8_t *>(data);
+	    const auto read = [&](uint32_t reg, void *buffer, uint32_t count) {
+	        return FunctionCast(wrapTGLReadAUX, callbackXE->orgTGLReadAUX)(port, reg, buffer, count);
+	    };
+	    if (scope && !bytes[address == PanelBandwidthSet ? 0 : PanelLinkRate - address] &&
+	        tglOptionalPanelCaps(read)) {
+	        if (address != PanelBandwidthSet) {
+	            bytes[PanelLinkRate - address] = PanelLegacyRates[7];
+	        } else {
+	            uint8_t rate {};
+	            if (!read(PanelRateSet, &rate, 1))
+	                bytes[0] = PanelLegacyRates[rate & 7U];
+	        }
+	    }
+	}
 	return r;
 }
 
 uint32_t XE::wrapTGLWriteAUX(void *port, uint32_t address, void *data, uint32_t length) {
 	auto caller = __builtin_return_address(0);
 	tglDPCDRecord(port, address, data, length, true, false, 0, caller);
-	const auto r = tglInvokeBootstrapAUX(callbackXE->tglBootstrapAUXReady, 1, port, [&] {
-		return FunctionCast(wrapTGLWriteAUX, callbackXE->orgTGLWriteAUX)(port, address, data, length);
+	const auto r = tglInvokeBootstrapAUX(callbackXE->tglBootstrapAUXReady, 1, port, [&]() -> uint32_t {
+	    const auto write = [&](uint32_t reg, void *buffer, uint32_t count) {
+	        return FunctionCast(wrapTGLWriteAUX, callbackXE->orgTGLWriteAUX)(port, reg, buffer, count);
+	    };
+	    auto bytes = static_cast<uint8_t *>(data);
+	    if (address != PanelBandwidthSet || !bytes || !length || length > 16 ||
+	        !callbackXE->tglOptionalPanelPort(port))
+	        return write(address, data, length);
+
+	    const auto index = tglOptionalPanelIndex(bytes[0]);
+	    if (index < 0)
+	        return write(address, data, length);
+
+	    PanelAUXScope scope(callbackXE->tglOptionalPanelAUXBusy);
+	    if (!scope)
+	        return kIOReturnBusy;
+	    const auto read = [&](uint32_t reg, void *buffer, uint32_t count) {
+	        return FunctionCast(wrapTGLReadAUX, callbackXE->orgTGLReadAUX)(port, reg, buffer, count);
+	    };
+	    if (!tglOptionalPanelCaps(read))
+	        return write(address, data, length);
+
+	    uint8_t rate {};
+	    if (const auto error = read(PanelRateSet, &rate, 1))
+	        return error;
+	    rate = (rate & 0xF8U) | static_cast<uint8_t>(index);
+	    if (const auto error = write(PanelRateSet, &rate, 1))
+	        return error;
+
+	    // Select the table entry before switching LINK_BW_SET to table mode,
+	    // matching the sequence tested on the SHP14B8.
+	    IODelay(100);
+	    uint8_t translated[16] {};
+	    memcpy(translated, bytes, length);
+	    translated[0] = 0;
+	    if (const auto error = write(address, translated, length))
+	        return error;
+	    if (const auto error = read(PanelRateSet, &rate, 1))
+	        return error;
+	    if ((rate & 7U) != static_cast<unsigned>(index))
+	        return kIOReturnIOError;
+	    IORegistryEntry::getRegistryRoot()->setProperty("WEXSharpOptionalRateIndex", static_cast<uint32_t>(index), 32);
+	    return 0;
 	});
 	tglDPCDRecord(port, address, data, length, true, true, r, caller);
 	return r;

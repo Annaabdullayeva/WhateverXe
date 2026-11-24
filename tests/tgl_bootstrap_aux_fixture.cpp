@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -17,11 +18,18 @@ void clock_get_uptime(uint64_t *v){*v=0;}void absolutetime_to_nanoseconds(uint64
 void IODelay(unsigned){assert(false);}void IOSleep(unsigned){assert(false);}
 static TGLPcodeGate tglPcodeGate;
 constexpr uint32_t kIOReturnNotReady=0xe00002d8;
+constexpr uint32_t kIOReturnBusy=0xe00002d5,kIOReturnIOError=0xe00002ca;
+struct IORegistryEntry {
+ static IORegistryEntry *getRegistryRoot(){assert(false);return nullptr;}
+ void setProperty(const char *,uint32_t,int){assert(false);}
+};
 #include "adapter.inc"
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
 template<class... T> void tglDPCDRecord(T...){}
 struct XE {
  bool tglBootstrapAUXReady {};uintptr_t orgTGLReadAUX {},orgTGLWriteAUX {},orgTGLI2CAUX {};
+ uint32_t tglOptionalPanelAUXBusy {};
+ bool tglOptionalPanelPort(void *) const {return false;}
  static uint32_t wrapTGLReadAUX(void*,uint32_t,void*,uint32_t);
  static uint32_t wrapTGLWriteAUX(void*,uint32_t,void*,uint32_t);
  static uint32_t wrapTGLI2CAUX(void*,uint32_t,uint32_t*,uint32_t,uint8_t);
