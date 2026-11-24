@@ -754,6 +754,9 @@ private:
 	mach_vm_address_t orgTGLPortTraining {}, orgTGLPathLookup {}, orgTGLFreePath {};
 	mach_vm_address_t orgTGLLightUpDP {}, orgTGLDisableDisplay {}, orgTGLEnablePipe {};
 	mach_vm_address_t orgTGLReadAUX {}, orgTGLWriteAUX {}, orgTGLI2CAUX {};
+	bool tglOptionalPanelRateReady {};
+	uint32_t tglOptionalPanelAUXBusy {};
+	bool tglOptionalPanelPort(void *port) const;
 	bool tglBootstrapAUXReady {};
 	static uint32_t wrapTGLPortTraining(void *port, void *request);
 	static void *wrapTGLPathLookup(void *port);

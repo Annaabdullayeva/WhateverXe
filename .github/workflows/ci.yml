@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, g83-shp14b8-test]
     tags: ['*']
   pull_request:
   workflow_dispatch:
@@ -47,6 +47,15 @@ jobs:
         run: python3 tools/build.py --output build/DEBUG
       - name: Build RELEASE
         run: python3 tools/build.py --release --output build/RELEASE
+      - name: Upload G83 test kext
+        if: github.ref_name == 'g83-shp14b8-test'
+        uses: actions/upload-artifact@v4
+        with:
+          name: G83-SHP14B8-RELEASE
+          path: |
+            build/RELEASE/WhateverXe.kext/**
+            build/RELEASE/build-manifest.json
+          if-no-files-found: error
       - name: Package
         shell: bash
         env:
